@@ -1,6 +1,10 @@
+import hashlib
+import json
 import os
-import re
 import random
+import re
+import shutil
+import subprocess
 import warnings
 from datetime import datetime
 
@@ -38,14 +42,18 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
 
-DATA_PATH = "./data/features_summary_renamed.csv"
+DATA_PATH = "./feature_out/features_summary_renamed.csv"
+SPLIT_MANIFEST_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "feature_out",
+    "split_manifest.csv",
+)
 SAVE_ROOT = "./output"
 os.makedirs(SAVE_ROOT, exist_ok=True)
 
@@ -72,10 +80,71 @@ CLASS_WEIGHT_CANDIDATES = [
     {0: 1.5, 1: 1.0},
     {0: 2.0, 1: 1.0},
 ]
+ABLATION_MODES = [
+    "full",
+    "wo_mean_speed",
+    "wo_std_speed",
+    "wo_mean_thd",
+    "wo_std_thd",
+    "wo_pulse_freq",
+    "wo_pulse_amp",
+    "wo_event_density",
+    "wo_missing",
+    "wo_derived",
+    "base_only",
+]
+DERIVED_FEATURE_DEPENDENCIES = {
+    "mean_speed": {
+        "d_density_speed",
+        "d_speed_density",
+        "d_speed_sq",
+        "d_stdspeed_speed",
+    },
+    "std_speed": {
+        "d_stdspeed_speed",
+        "d_sqrt_freq_speedstd",
+    },
+    "mean_thd": {
+        "d_amp_thd",
+        "d_stdthd_thd",
+        "d_thd_density",
+        "d_thd_sq",
+        "d_amp_minus_thd",
+    },
+    "std_thd": {
+        "d_stdthd_thd",
+    },
+    "pulse_freq": {
+        "d_freq_amp",
+        "d_freq_density",
+        "d_freq_density_ratio",
+        "d_freq_sq",
+        "d_sqrt_freq_speedstd",
+    },
+    "pulse_amp": {
+        "d_amp_thd",
+        "d_freq_amp",
+        "d_amp_density",
+        "d_amp_sq",
+        "d_amp_minus_thd",
+    },
+    "event_density": {
+        "d_density_speed",
+        "d_amp_density",
+        "d_freq_density",
+        "d_thd_density",
+        "d_speed_density",
+        "d_density_sq",
+        "d_freq_density_ratio",
+    },
+}
 BOOTSTRAP_REPS = 2000
 CALIBRATION_BINS = 10
 THRESHOLD_OBJECTIVE = "balanced_acc"
 THRESHOLD_GRID = np.arange(0.0, 1.001, 0.01)
+CONFIG_SNAPSHOT_PATH = ""
+CONFIG_SHA256 = ""
+CODE_COMMIT = ""
 
 EPOCH_METRIC_COLUMNS = [
     "model", "ablation", "outer_fold", "inner_fold", "seed", "epoch",
@@ -84,9 +153,10 @@ EPOCH_METRIC_COLUMNS = [
 ]
 RUN_MANIFEST_COLUMNS = [
     "run_id", "model", "ablation", "outer_fold", "seed", "config_file",
-    "config_sha256", "code_commit", "start_time", "end_time",
-    "selected_epoch", "selected_threshold", "threshold_objective",
-    "checkpoint_path",
+    "config_sha256", "training_manifest_sha256", "code_commit",
+    "start_time", "end_time", "selected_epoch", "selected_threshold",
+    "threshold_objective", "checkpoint_path", "relative_path", "bytes",
+    "sha256",
 ]
 PREDICTION_COLUMNS = [
     "model", "ablation", "animal_id", "label", "outer_fold",
@@ -106,117 +176,295 @@ def get_original_video_key(filename):
     return re.sub(r"_aug_\d+(\.csv)?$", "", filename).replace(".csv", "")
 
 
-def save_split_manifest(video_meta, output_path):
-    """保存 outer/inner 的固定视频级划分清单。"""
-    rows = []
-    label_map = dict(
-        zip(video_meta["video_key"].astype(str), video_meta["label"].astype(int))
+def sha256_file(file_path):
+    """计算文件 SHA-256。"""
+    digest = hashlib.sha256()
+    with open(file_path, "rb") as file_obj:
+        for chunk in iter(lambda: file_obj.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def get_git_commit():
+    """获取当前代码所在 Git 仓库的完整 commit。"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            check=False,
+        )
+        commit = result.stdout.strip()
+        return commit if commit else "not_available"
+    except (OSError, subprocess.SubprocessError):
+        return "not_available"
+
+
+def build_config_snapshot(ablation_mode=None):
+    """收集本次训练实际使用的配置。"""
+    config_names = [
+        "DATA_PATH", "SPLIT_MANIFEST_PATH", "SAVE_ROOT", "FEATURE_COLS",
+        "USE_MISSING_INDICATORS", "USE_NUM_SEGMENTS", "SEED",
+        "OUTER_FOLD", "INNER_FOLD", "N_ESTIMATORS",
+        "CLASS_WEIGHT_CANDIDATES", "BOOTSTRAP_REPS", "CALIBRATION_BINS",
+        "THRESHOLD_OBJECTIVE", "THRESHOLD_GRID", "ABLATION_MODES",
+    ]
+    config = {"source_file": os.path.abspath(__file__)}
+    for name in config_names:
+        value = globals()[name]
+        if isinstance(value, np.ndarray):
+            value = value.tolist()
+        elif isinstance(value, tuple):
+            value = list(value)
+        config[name] = value
+    if ablation_mode is not None:
+        if ablation_mode not in ABLATION_MODES:
+            raise ValueError(f"未知消融模式: {ablation_mode}")
+        config["ablation_mode"] = ablation_mode
+    return config
+
+
+def prepare_run_metadata(output_root=None, ablation_mode=None):
+    """生成配置快照、配置 SHA-256 和代码 commit。"""
+    global CONFIG_SNAPSHOT_PATH, CONFIG_SHA256, CODE_COMMIT
+
+    if output_root is None:
+        output_root = SAVE_ROOT
+    os.makedirs(output_root, exist_ok=True)
+    config_path = os.path.abspath(
+        os.path.join(output_root, "config_snapshot.json")
+    )
+    with open(config_path, "w", encoding="utf-8") as file_obj:
+        json.dump(
+            build_config_snapshot(ablation_mode),
+            file_obj,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+            default=str,
+        )
+        file_obj.write("\n")
+
+    CONFIG_SNAPSHOT_PATH = config_path
+    CONFIG_SHA256 = sha256_file(config_path)
+    CODE_COMMIT = get_git_commit()
+
+
+def load_split_manifest(video_meta, manifest_path):
+    """读取并校验固定的 outer/inner 五折视频划分。"""
+    manifest_path = os.path.abspath(manifest_path)
+    if not os.path.isfile(manifest_path):
+        raise FileNotFoundError(f"训练划分清单不存在：{manifest_path}")
+
+    manifest = pd.read_csv(
+        manifest_path,
+        dtype={"animal_id": str, "video_key": str},
+    )
+    manifest.columns = manifest.columns.astype(str).str.strip()
+    required = {"video_key", "label", "outer_fold", "role", "inner_fold"}
+    missing = required - set(manifest.columns)
+    if missing:
+        raise ValueError(f"训练划分清单缺少字段：{sorted(missing)}")
+
+    manifest["video_key"] = manifest["video_key"].astype(str).str.strip()
+    manifest["role"] = manifest["role"].astype(str).str.strip()
+    manifest["label"] = pd.to_numeric(
+        manifest["label"], errors="raise"
+    ).astype(int)
+    manifest["outer_fold"] = pd.to_numeric(
+        manifest["outer_fold"], errors="raise"
+    ).astype(int)
+    manifest["inner_fold"] = pd.to_numeric(
+        manifest["inner_fold"], errors="coerce"
     )
 
-    outer_cv = StratifiedGroupKFold(
-        n_splits=OUTER_FOLD,
-        shuffle=True,
-        random_state=SEED,
-    )
+    allowed_roles = {"outer_test", "inner_train", "inner_val"}
+    unknown_roles = sorted(set(manifest["role"]) - allowed_roles)
+    if unknown_roles:
+        raise ValueError(f"训练划分清单包含未知 role：{unknown_roles}")
+    if manifest.loc[
+        manifest["role"].isin({"inner_train", "inner_val"}),
+        "inner_fold",
+    ].isna().any():
+        raise ValueError("inner_train/inner_val 记录缺少 inner_fold")
+    if manifest.duplicated(
+        ["video_key", "outer_fold", "role", "inner_fold"]
+    ).any():
+        raise ValueError("训练划分清单包含重复记录")
 
-    for outer_fold, (outer_train_idx, outer_test_idx) in enumerate(
-        outer_cv.split(
-            video_meta,
-            video_meta["label"],
-            groups=video_meta["video_key"],
-        ),
-        start=1,
+    video_keys = video_meta["video_key"].astype(str)
+    dataset_keys = set(video_keys)
+    manifest_keys = set(manifest["video_key"])
+    if dataset_keys != manifest_keys:
+        missing_keys = sorted(dataset_keys - manifest_keys)
+        extra_keys = sorted(manifest_keys - dataset_keys)
+        raise ValueError(
+            "训练数据与划分清单的视频不一致："
+            f"missing={missing_keys[:10]}, extra={extra_keys[:10]}"
+        )
+
+    label_map = dict(zip(video_keys, video_meta["label"].astype(int)))
+    expected_labels = manifest["video_key"].map(label_map)
+    if not manifest["label"].eq(expected_labels).all():
+        bad_keys = manifest.loc[
+            ~manifest["label"].eq(expected_labels), "video_key"
+        ].drop_duplicates().tolist()
+        raise ValueError(f"训练数据与划分清单标签不一致：{bad_keys[:10]}")
+
+    expected_outer_folds = list(range(1, OUTER_FOLD + 1))
+    actual_outer_folds = sorted(manifest["outer_fold"].unique().tolist())
+    if actual_outer_folds != expected_outer_folds:
+        raise ValueError(
+            f"outer fold 应为 {expected_outer_folds}，实际为 {actual_outer_folds}"
+        )
+
+    outer_test_rows = manifest[manifest["role"].eq("outer_test")]
+    outer_test_counts = outer_test_rows["video_key"].value_counts()
+    if (
+        set(outer_test_counts.index) != dataset_keys
+        or not outer_test_counts.eq(1).all()
     ):
-        outer_train = video_meta.iloc[outer_train_idx].reset_index(drop=True)
-        outer_test = video_meta.iloc[outer_test_idx].reset_index(drop=True)
+        raise ValueError("每个视频必须且只能出现于一个 outer_test fold")
 
-        for key in outer_test["video_key"].astype(str):
-            rows.append(
-                {
-                    "animal_id": key,
-                    "video_key": key,
-                    "label": label_map[key],
-                    "outer_fold": outer_fold,
-                    "role": "outer_test",
-                    "inner_fold": "",
-                    "split_seed": SEED,
-                    "split_version": "sgkf_v1",
-                }
+    index_by_key = {key: index for index, key in enumerate(video_keys)}
+    outer_splits = []
+    for outer_fold in expected_outer_folds:
+        fold_manifest = manifest[manifest["outer_fold"].eq(outer_fold)]
+        test_keys = set(
+            fold_manifest.loc[
+                fold_manifest["role"].eq("outer_test"), "video_key"
+            ]
+        )
+        train_keys = dataset_keys - test_keys
+        inner_manifest = fold_manifest[
+            fold_manifest["role"].isin({"inner_train", "inner_val"})
+        ]
+        if set(inner_manifest["video_key"]) != train_keys:
+            raise ValueError(f"outer fold {outer_fold} 的训练视频集合不完整")
+
+        expected_inner_folds = list(range(1, INNER_FOLD + 1))
+        actual_inner_folds = sorted(
+            inner_manifest["inner_fold"].astype(int).unique().tolist()
+        )
+        if actual_inner_folds != expected_inner_folds:
+            raise ValueError(
+                f"outer fold {outer_fold} 的 inner fold 应为 "
+                f"{expected_inner_folds}，实际为 {actual_inner_folds}"
             )
 
-        n_inner = min(
-            INNER_FOLD,
-            int(outer_train["label"].value_counts().min()),
-        )
-        inner_cv = StratifiedGroupKFold(
-            n_splits=n_inner,
-            shuffle=True,
-            random_state=SEED + outer_fold * 100,
-        )
+        for inner_fold in expected_inner_folds:
+            current = inner_manifest[
+                inner_manifest["inner_fold"].eq(inner_fold)
+            ]
+            inner_train_keys = set(
+                current.loc[current["role"].eq("inner_train"), "video_key"]
+            )
+            inner_val_keys = set(
+                current.loc[current["role"].eq("inner_val"), "video_key"]
+            )
+            if inner_train_keys & inner_val_keys:
+                raise ValueError(
+                    f"outer fold {outer_fold} / inner fold {inner_fold} 存在重叠"
+                )
+            if inner_train_keys | inner_val_keys != train_keys:
+                raise ValueError(
+                    f"outer fold {outer_fold} / inner fold {inner_fold} "
+                    "未完整覆盖 outer train"
+                )
 
-        for inner_fold, (inner_train_idx, inner_val_idx) in enumerate(
-            inner_cv.split(
-                outer_train,
-                outer_train["label"],
-                groups=outer_train["video_key"],
-            ),
-            start=1,
+        inner_val_counts = inner_manifest.loc[
+            inner_manifest["role"].eq("inner_val"), "video_key"
+        ].value_counts()
+        if (
+            set(inner_val_counts.index) != train_keys
+            or not inner_val_counts.eq(1).all()
         ):
-            for role, indices in (
-                ("inner_train", inner_train_idx),
-                ("inner_val", inner_val_idx),
-            ):
-                for key in outer_train.iloc[indices]["video_key"].astype(str):
-                    rows.append(
-                        {
-                            "animal_id": key,
-                            "video_key": key,
-                            "label": label_map[key],
-                            "outer_fold": outer_fold,
-                            "role": role,
-                            "inner_fold": inner_fold,
-                            "split_seed": SEED + outer_fold * 100,
-                            "split_version": "sgkf_v1",
-                        }
-                    )
+            raise ValueError(
+                f"outer fold {outer_fold} 的每个训练视频必须且只能验证一次"
+            )
 
-    pd.DataFrame(rows).to_csv(
-        output_path,
-        index=False,
-        encoding="utf-8-sig",
-    )
+        train_idx = np.asarray(
+            [index_by_key[key] for key in video_keys if key in train_keys],
+            dtype=np.int64,
+        )
+        test_idx = np.asarray(
+            [index_by_key[key] for key in video_keys if key in test_keys],
+            dtype=np.int64,
+        )
+        outer_splits.append((train_idx, test_idx))
+
+    return manifest, outer_splits
 
 
-def save_run_manifest(summary, output_root):
-    """保存每个 outer fold 的运行、阈值和模型文件记录。"""
+def save_run_manifest(summary, output_root, ablation_mode):
+    """保存正式运行清单和模型文件哈希。"""
+    global CONFIG_SNAPSHOT_PATH, CONFIG_SHA256, CODE_COMMIT
+
+    if not CONFIG_SNAPSHOT_PATH:
+        prepare_run_metadata(output_root, ablation_mode)
+
     now = datetime.now().isoformat(timespec="seconds")
+    model_paths = []
+    for relative_model_path in summary["model_bundle"].astype(str):
+        model_path = os.path.abspath(
+            os.path.join(output_root, relative_model_path)
+        )
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(f"模型文件不存在：{model_path}")
+        model_paths.append(model_path)
+
     required = pd.DataFrame({
-        "run_id": [f"rf_ensemble_outer_fold_{int(fold)}" for fold in summary["fold"]],
+        "run_id": [
+            f"rf_ensemble_{ablation_mode}_outer_fold_{int(fold)}"
+            for fold in summary["fold"]
+        ],
         "model": "rf_ensemble",
-        "ablation": "full",
+        "ablation": ablation_mode,
         "outer_fold": summary["fold"].astype(int),
         "seed": SEED,
-        "config_file": "",
-        "config_sha256": "",
-        "code_commit": "",
+        "config_file": CONFIG_SNAPSHOT_PATH,
+        "config_sha256": CONFIG_SHA256,
+        "training_manifest_sha256": sha256_file(SPLIT_MANIFEST_PATH),
+        "code_commit": CODE_COMMIT,
         "start_time": now,
         "end_time": now,
         "selected_epoch": np.nan,
         "selected_threshold": summary["threshold"],
         "threshold_objective": THRESHOLD_OBJECTIVE,
-        "checkpoint_path": [
-            os.path.abspath(os.path.join(output_root, path))
-            for path in summary["model_bundle"]
+        "checkpoint_path": model_paths,
+        "relative_path": [
+            os.path.relpath(path, SAVE_ROOT).replace(os.sep, "/")
+            for path in model_paths
         ],
+        "bytes": [os.path.getsize(path) for path in model_paths],
+        "sha256": [sha256_file(path) for path in model_paths],
     })
     extras = summary.drop(columns=["threshold"], errors="ignore").reset_index(drop=True)
-    manifest = pd.concat([required, extras], axis=1)
+    manifest = required.copy()
+    for column in extras.columns:
+        if column not in manifest.columns:
+            manifest[column] = extras[column].to_numpy()
+    manifest = manifest.loc[:, ~manifest.columns.duplicated()]
+    ordered_columns = RUN_MANIFEST_COLUMNS + [
+        column for column in manifest.columns
+        if column not in RUN_MANIFEST_COLUMNS
+    ]
     logs_dir = os.path.join(output_root, "logs")
     os.makedirs(logs_dir, exist_ok=True)
-    manifest[RUN_MANIFEST_COLUMNS + [
-        col for col in manifest.columns if col not in RUN_MANIFEST_COLUMNS
-    ]].to_csv(
+    manifest[ordered_columns].to_csv(
         os.path.join(logs_dir, "run_manifest.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    global_path = os.path.join(SAVE_ROOT, "logs", "run_manifest.csv")
+    os.makedirs(os.path.dirname(global_path), exist_ok=True)
+    header = not os.path.exists(global_path) or os.path.getsize(global_path) == 0
+    manifest[RUN_MANIFEST_COLUMNS].to_csv(
+        global_path,
+        mode="a",
+        header=header,
         index=False,
         encoding="utf-8-sig",
     )
@@ -313,6 +561,30 @@ def build_segment_features(df, fill_values):
     ).fillna(0.0).clip(-1e4, 1e4).astype(np.float32)
 
 
+def select_feature_columns(all_columns, ablation_mode):
+    if ablation_mode not in ABLATION_MODES:
+        raise ValueError(f"未知消融模式: {ablation_mode}")
+    if ablation_mode == "full":
+        return list(all_columns)
+    if ablation_mode == "wo_missing":
+        return [col for col in all_columns if not col.endswith("__missing")]
+    if ablation_mode == "wo_derived":
+        return [col for col in all_columns if not col.startswith("d_")]
+    if ablation_mode == "base_only":
+        return [col for col in all_columns if col in FEATURE_COLS]
+    if ablation_mode.startswith("wo_"):
+        base_feature = ablation_mode[3:]
+        if base_feature not in FEATURE_COLS:
+            raise ValueError(f"未知特征消融模式: {ablation_mode}")
+        removed = {
+            base_feature,
+            f"{base_feature}__missing",
+            *DERIVED_FEATURE_DEPENDENCIES.get(base_feature, set()),
+        }
+        return [col for col in all_columns if col not in removed]
+    raise AssertionError(ablation_mode)
+
+
 def aggregate_video_features(segment_df, row_feature_cols):
     rows = []
     for video_key, group in segment_df.groupby("video_key", sort=True):
@@ -335,7 +607,7 @@ def aggregate_video_features(segment_df, row_feature_cols):
     ).fillna(0.0)
 
 
-def prepare_video_matrices(df_fit, df_eval):
+def prepare_video_matrices(df_fit, df_eval, ablation_mode="full"):
     fill_values = fit_fill_values(df_fit)
     fit_row = build_segment_features(df_fit, fill_values).copy()
     eval_row = build_segment_features(df_eval, fill_values).copy()
@@ -344,10 +616,13 @@ def prepare_video_matrices(df_fit, df_eval):
     eval_row["video_key"] = df_eval["video_key"].to_numpy()
     eval_row["label"] = df_eval["label"].to_numpy()
 
-    row_feature_cols = [
+    all_row_feature_cols = [
         col for col in fit_row.columns
         if col not in {"video_key", "label"}
     ]
+    row_feature_cols = select_feature_columns(
+        all_row_feature_cols, ablation_mode
+    )
     fit_video = aggregate_video_features(fit_row, row_feature_cols)
     eval_video = aggregate_video_features(eval_row, row_feature_cols)
     video_feature_cols = [
@@ -364,6 +639,7 @@ def prepare_video_matrices(df_fit, df_eval):
         "fill_values": fill_values,
         "row_feature_cols": row_feature_cols,
         "video_feature_cols": video_feature_cols,
+        "ablation_mode": ablation_mode,
     }
 
 
@@ -817,30 +1093,39 @@ def save_pooled_paper_table(metrics, bootstrap, calibration, output_root):
         pass
 
 
-def make_inner_oof_predictions(df_outer_train, train_meta, fold_idx, class_weight):
-    min_count = int(train_meta["label"].value_counts().min())
-    n_splits = min(INNER_FOLD, min_count)
-    if n_splits < 2:
-        raise ValueError("内部 OOF 至少需要每类 2 个视频")
-
-    cv = StratifiedGroupKFold(
-        n_splits=n_splits,
-        shuffle=True,
-        random_state=SEED + fold_idx * 100,
-    )
+def make_inner_oof_predictions(
+    df_outer_train,
+    train_meta,
+    split_manifest,
+    fold_idx,
+    class_weight,
+    ablation_mode,
+):
     keys = train_meta["video_key"].to_numpy()
     labels = train_meta["label"].to_numpy()
     key_to_index = {key: idx for idx, key in enumerate(keys)}
     oof_prob = np.full(len(keys), np.nan, dtype=np.float64)
 
-    for inner_idx, (fit_idx, val_idx) in enumerate(
-        cv.split(train_meta, labels, groups=train_meta["video_key"]), start=1
-    ):
-        fit_keys = set(train_meta.iloc[fit_idx]["video_key"])
-        val_keys = set(train_meta.iloc[val_idx]["video_key"])
+    fold_manifest = split_manifest[
+        split_manifest["outer_fold"].eq(fold_idx)
+    ]
+    for inner_idx in range(1, INNER_FOLD + 1):
+        inner_manifest = fold_manifest[
+            fold_manifest["inner_fold"].eq(inner_idx)
+        ]
+        fit_keys = set(
+            inner_manifest.loc[
+                inner_manifest["role"].eq("inner_train"), "video_key"
+            ]
+        )
+        val_keys = set(
+            inner_manifest.loc[
+                inner_manifest["role"].eq("inner_val"), "video_key"
+            ]
+        )
         df_fit = df_outer_train[df_outer_train["video_key"].isin(fit_keys)].copy()
         df_val = df_outer_train[df_outer_train["video_key"].isin(val_keys)].copy()
-        data = prepare_video_matrices(df_fit, df_val)
+        data = prepare_video_matrices(df_fit, df_val, ablation_mode)
         models = fit_models(data["X_fit"], data["y_fit"], SEED + fold_idx * 100 + inner_idx, class_weight)
         val_prob = predict_ensemble(models, data["X_eval"])
         for key, prob in zip(data["eval_video"]["video_key"].to_numpy(), val_prob):
@@ -854,7 +1139,9 @@ def make_inner_oof_predictions(df_outer_train, train_meta, fold_idx, class_weigh
 def select_class_weight_and_threshold(
     df_outer_train,
     train_meta,
+    split_manifest,
     fold_idx,
+    ablation_mode,
 ):
     """
     在 outer-train 内部使用 inner-OOF 同时选择 class_weight 和阈值。
@@ -868,8 +1155,10 @@ def select_class_weight_and_threshold(
         y_oof, prob_oof = make_inner_oof_predictions(
             df_outer_train,
             train_meta,
+            split_manifest,
             fold_idx,
             class_weight,
+            ablation_mode,
         )
 
         threshold = search_best_threshold(
@@ -932,59 +1221,47 @@ def select_class_weight_and_threshold(
     ]
     return best
 
-def main():
-    seed_everything(SEED)
-    df = pd.read_csv(DATA_PATH)
-    df.columns = df.columns.astype(str).str.strip()
-    df["filename"] = df["filename"].astype(str)
-    df["video_key"] = df["filename"].apply(get_original_video_key)
-    df["label"] = df["label"].astype(int)
-    validate_input(df)
 
-    video_meta = (
-        df[["video_key", "label"]]
-        .drop_duplicates()
-        .sort_values("video_key")
-        .reset_index(drop=True)
-    )
-    min_count = int(video_meta["label"].value_counts().min())
-    if min_count < OUTER_FOLD:
-        raise ValueError(f"最少类别只有 {min_count} 个视频，无法进行 {OUTER_FOLD} 折 CV")
-    save_split_manifest(
-        video_meta,
-        os.path.join(SAVE_ROOT, "split_manifest.csv"),
-    )
-    print(
-        f"片段数={len(df)}, 视频数={len(video_meta)}, "
-        f"类别分布={video_meta['label'].value_counts().to_dict()}"
-    )
-
-    outer_cv = StratifiedGroupKFold(
-        n_splits=OUTER_FOLD,
-        shuffle=True,
-        random_state=SEED,
-    )
-    summary_rows, all_test, fold_thresholds = [], [], []
+def run_one_ablation(
+    df,
+    video_meta,
+    split_manifest,
+    outer_splits,
+    ablation_mode,
+):
+    output_root = os.path.join(SAVE_ROOT, ablation_mode)
+    os.makedirs(output_root, exist_ok=True)
+    prepare_run_metadata(output_root, ablation_mode)
+    summary_rows, all_test = [], []
     epoch_metric_rows = []
 
     for fold_idx, (train_idx, test_idx) in enumerate(
-        outer_cv.split(video_meta, video_meta["label"], groups=video_meta["video_key"]),
+        outer_splits,
         start=1,
     ):
-        fold_dir = os.path.join(SAVE_ROOT, f"fold_{fold_idx}")
+        fold_dir = os.path.join(output_root, f"fold_{fold_idx}")
         os.makedirs(fold_dir, exist_ok=True)
         train_meta = video_meta.iloc[train_idx].reset_index(drop=True)
         test_meta = video_meta.iloc[test_idx].reset_index(drop=True)
-        train_keys, test_keys = set(train_meta["video_key"]), set(test_meta["video_key"])
+        train_keys = set(train_meta["video_key"])
+        test_keys = set(test_meta["video_key"])
         df_train = df[df["video_key"].isin(train_keys)].copy()
         df_test = df[df["video_key"].isin(test_keys)].copy()
 
-        print(f"\n================ Fold {fold_idx}/{OUTER_FOLD} ================")
+        print(
+            f"\n================ {ablation_mode} | "
+            f"Fold {fold_idx}/{OUTER_FOLD} ================"
+        )
         print("选择 class_weight 和 OOF threshold...")
-        best = select_class_weight_and_threshold(df_train, train_meta, fold_idx)
+        best = select_class_weight_and_threshold(
+            df_train,
+            train_meta,
+            split_manifest,
+            fold_idx,
+            ablation_mode,
+        )
         class_weight = best["class_weight"]
         threshold = best["threshold"]
-        fold_thresholds.append(threshold)
         pd.DataFrame(best["candidate_metrics"]).to_csv(
             os.path.join(fold_dir, "threshold_selection_candidates.csv"),
             index=False,
@@ -994,7 +1271,7 @@ def main():
         inner_oof_frame = pd.DataFrame(
             {
                 "model": "rf_ensemble",
-                "ablation": "full",
+                "ablation": ablation_mode,
                 "animal_id": train_meta["video_key"].astype(str),
                 "video_key": train_meta["video_key"].astype(str),
                 "label": best["y_oof"],
@@ -1017,17 +1294,27 @@ def main():
             encoding="utf-8-sig",
         )
 
-        data = prepare_video_matrices(df_train, df_test)
-        models = fit_models(data["X_fit"], data["y_fit"], SEED + 1000 + fold_idx, class_weight)
+        data = prepare_video_matrices(
+            df_train, df_test, ablation_mode
+        )
+        models = fit_models(
+            data["X_fit"],
+            data["y_fit"],
+            SEED + 1000 + fold_idx,
+            class_weight,
+        )
         test_prob = predict_ensemble(models, data["X_eval"])
         test_pred = (test_prob >= threshold).astype(np.int64)
-        test_metric = calculate_metrics(data["y_eval"], test_pred, test_prob)
+        test_metric = calculate_metrics(
+            data["y_eval"], test_pred, test_prob
+        )
 
         metadata = {
             "feature_cols": FEATURE_COLS,
             "row_feature_cols": data["row_feature_cols"],
             "video_feature_cols": data["video_feature_cols"],
             "fill_values": data["fill_values"],
+            "ablation_mode": ablation_mode,
             "class_weight": class_weight,
             "threshold": threshold,
             "threshold_objective": THRESHOLD_OBJECTIVE,
@@ -1042,15 +1329,19 @@ def main():
             "feature_config": {
                 "use_missing_indicators": bool(USE_MISSING_INDICATORS),
                 "use_num_segments": bool(USE_NUM_SEGMENTS),
+                "ablation_mode": ablation_mode,
             },
         }
+        bundle_path = os.path.join(
+            fold_dir, "video_ensemble_bundle.pkl"
+        )
         joblib.dump(
             {"models": models, "metadata": metadata},
-            os.path.join(fold_dir, "video_ensemble_bundle.pkl"),
+            bundle_path,
         )
         epoch_metric_rows.append({
             "model": "rf_ensemble",
-            "ablation": "full",
+            "ablation": ablation_mode,
             "outer_fold": fold_idx,
             "inner_fold": 0,
             "seed": SEED + 1000 + fold_idx,
@@ -1066,7 +1357,7 @@ def main():
 
         test_video = data["eval_video"][["video_key", "label"]].copy()
         test_video["model"] = "rf_ensemble"
-        test_video["ablation"] = "full"
+        test_video["ablation"] = ablation_mode
         test_video["animal_id"] = test_video["video_key"].astype(str)
         test_video["prob"] = test_prob
         test_video["pred"] = test_pred
@@ -1077,20 +1368,28 @@ def main():
         test_video["fold_threshold"] = threshold
         test_video["threshold_objective"] = THRESHOLD_OBJECTIVE
         test_video["checkpoint_id"] = os.path.relpath(
-            os.path.join(fold_dir, "video_ensemble_bundle.pkl"),
+            bundle_path,
             SAVE_ROOT,
         )
-        test_video.to_csv(os.path.join(fold_dir, "fold_test_vid_pred.csv"), index=False, encoding="utf-8-sig")
+        test_video.to_csv(
+            os.path.join(fold_dir, "fold_test_vid_pred.csv"),
+            index=False,
+            encoding="utf-8-sig",
+        )
         all_test.append(test_video)
 
         print(f"selected weight={class_weight}, threshold={threshold:.4f}")
         print(
-            f"Test ACC={test_metric['ACC']:.4f}, AUC={test_metric['AUC']:.4f}, "
-            f"PR-AUC={test_metric['PR-AUC']:.4f}, Spec={test_metric['Specificity']:.4f}, "
+            f"Test ACC={test_metric['ACC']:.4f}, "
+            f"AUC={test_metric['AUC']:.4f}, "
+            f"PR-AUC={test_metric['PR-AUC']:.4f}, "
+            f"Spec={test_metric['Specificity']:.4f}, "
             f"Sens={test_metric['Sensitivity']:.4f}"
         )
         summary_rows.append({
+            "ablation": ablation_mode,
             "fold": fold_idx,
+            "outer_fold": fold_idx,
             "class_weight": str(class_weight),
             "threshold": threshold,
             "test_acc": test_metric["ACC"],
@@ -1101,62 +1400,184 @@ def main():
             "test_specificity": test_metric["Specificity"],
             "test_sensitivity": test_metric["Sensitivity"],
             "model_bundle": os.path.relpath(
-                os.path.join(fold_dir, "video_ensemble_bundle.pkl"),
-                SAVE_ROOT,
+                bundle_path,
+                output_root,
             ),
         })
 
     summary = pd.DataFrame(summary_rows)
-    save_fold_mean_std(summary, SAVE_ROOT)
-    summary.to_csv(os.path.join(SAVE_ROOT, "outer_5fold_summary.csv"), index=False, encoding="utf-8-sig")
-    all_test = pd.concat(all_test, ignore_index=True)
-    all_test.to_csv(os.path.join(SAVE_ROOT, "all_outer_test_vid_pred.csv"), index=False, encoding="utf-8-sig")
-    all_test[PREDICTION_COLUMNS].to_csv(
-        os.path.join(SAVE_ROOT, "standardized_predictions.csv"),
+    save_fold_mean_std(summary, output_root)
+    summary.to_csv(
+        os.path.join(output_root, "outer_5fold_summary.csv"),
         index=False,
         encoding="utf-8-sig",
     )
-    save_run_manifest(summary, SAVE_ROOT)
-    save_epoch_metrics(epoch_metric_rows, SAVE_ROOT)
+    all_test = pd.concat(all_test, ignore_index=True)
+    all_test.to_csv(
+        os.path.join(output_root, "all_outer_test_vid_pred.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    all_test[PREDICTION_COLUMNS].to_csv(
+        os.path.join(output_root, "standardized_predictions.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    save_run_manifest(summary, output_root, ablation_mode)
+    save_epoch_metrics(epoch_metric_rows, output_root)
 
     # 直接使用每个 outer fold 根据 inner-OOF 阈值生成的 prediction。
-    # 不再使用全局中位数阈值覆盖各 fold 的 outer-test prediction。
     pooled_pred = all_test["prediction"].to_numpy(dtype=np.int64)
-
     pooled_metric = calculate_metrics(
         y_true=all_test["label"].to_numpy(dtype=np.int64),
         y_pred=pooled_pred,
         y_prob=all_test["prob"].to_numpy(dtype=np.float64),
     )
-
     pooled_metrics, pooled_bootstrap, pooled_calibration = save_test_statistics(
         all_test,
-        SAVE_ROOT,
-        model_name="ensemble",
+        output_root,
+        model_name=f"rf_ensemble_{ablation_mode}",
         predicted=pooled_pred,
     )
     save_pooled_paper_table(
         pooled_metrics,
         pooled_bootstrap,
         pooled_calibration,
-        SAVE_ROOT,
+        output_root,
     )
 
-    print("\n================ OOF 5-fold Summary ================")
+    print(f"\n================ {ablation_mode} OOF 5-fold Summary ================")
     print(summary.to_string(index=False))
-    print("\n================ Pooled OOF Test ================")
+    print(f"\n================ {ablation_mode} Pooled OOF Test ================")
     print(
-        f"threshold=per-fold inner-OOF balanced-accuracy, ACC={pooled_metric['ACC']:.4f}, "
-        f"AUC={pooled_metric['AUC']:.4f}, PR-AUC={pooled_metric['PR-AUC']:.4f}, "
-        f"F1={pooled_metric['F1']:.4f}, BalAcc={pooled_metric['Balanced_ACC']:.4f}, "
-        f"Spec={pooled_metric['Specificity']:.4f}, Sens={pooled_metric['Sensitivity']:.4f}"
+        "threshold=per-fold inner-OOF balanced-accuracy, "
+        f"ACC={pooled_metric['ACC']:.4f}, AUC={pooled_metric['AUC']:.4f}, "
+        f"PR-AUC={pooled_metric['PR-AUC']:.4f}, "
+        f"F1={pooled_metric['F1']:.4f}, "
+        f"BalAcc={pooled_metric['Balanced_ACC']:.4f}, "
+        f"Spec={pooled_metric['Specificity']:.4f}, "
+        f"Sens={pooled_metric['Sensitivity']:.4f}"
     )
     print("\n================ Mean ± Std ================")
-    for col in [
+    for column in [
         "test_acc", "test_auc", "test_prauc", "test_f1", "test_bal_acc",
         "test_sensitivity", "test_specificity",
     ]:
-        print(f"{col:12s}: {summary[col].mean():.4f} ± {summary[col].std():.4f}")
+        print(
+            f"{column:12s}: {summary[column].mean():.4f} "
+            f"± {summary[column].std():.4f}"
+        )
+    return (
+        summary,
+        all_test,
+        pooled_metrics,
+        pooled_bootstrap,
+        pooled_calibration,
+        epoch_metric_rows,
+    )
+
+
+def main():
+    seed_everything(SEED)
+    prepare_run_metadata()
+    os.makedirs(os.path.join(SAVE_ROOT, "logs"), exist_ok=True)
+    pd.DataFrame(columns=RUN_MANIFEST_COLUMNS).to_csv(
+        os.path.join(SAVE_ROOT, "logs", "run_manifest.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    df = pd.read_csv(DATA_PATH)
+    df.columns = df.columns.astype(str).str.strip()
+    df["filename"] = df["filename"].astype(str)
+    df["video_key"] = df["filename"].apply(get_original_video_key)
+    df["label"] = df["label"].astype(int)
+    validate_input(df)
+
+    video_meta = (
+        df[["video_key", "label"]]
+        .drop_duplicates()
+        .sort_values("video_key")
+        .reset_index(drop=True)
+    )
+    min_count = int(video_meta["label"].value_counts().min())
+    if min_count < OUTER_FOLD:
+        raise ValueError(
+            f"最少类别只有 {min_count} 个视频，无法进行 {OUTER_FOLD} 折 CV"
+        )
+    split_manifest, outer_splits = load_split_manifest(
+        video_meta, SPLIT_MANIFEST_PATH
+    )
+    output_manifest_path = os.path.join(SAVE_ROOT, "split_manifest.csv")
+    if os.path.abspath(output_manifest_path) != os.path.abspath(SPLIT_MANIFEST_PATH):
+        shutil.copyfile(SPLIT_MANIFEST_PATH, output_manifest_path)
+    print(
+        f"片段数={len(df)}, 视频数={len(video_meta)}, "
+        f"类别分布={video_meta['label'].value_counts().to_dict()}"
+    )
+
+    summaries = []
+    prediction_frames = []
+    pooled_metric_rows = []
+    pooled_bootstrap_frames = []
+    pooled_calibration_rows = []
+    all_epoch_metric_rows = []
+    for ablation_mode in ABLATION_MODES:
+        (
+            summary,
+            predictions,
+            metrics,
+            bootstrap,
+            calibration,
+            epoch_metric_rows,
+        ) = run_one_ablation(
+            df,
+            video_meta,
+            split_manifest,
+            outer_splits,
+            ablation_mode,
+        )
+        summaries.append(summary)
+        prediction_frames.append(predictions)
+        pooled_metric_rows.append({"ablation": ablation_mode, **metrics})
+        bootstrap = bootstrap.copy()
+        bootstrap.insert(0, "ablation", ablation_mode)
+        pooled_bootstrap_frames.append(bootstrap)
+        pooled_calibration_rows.append({
+            "ablation": ablation_mode,
+            **calibration,
+        })
+        all_epoch_metric_rows.extend(epoch_metric_rows)
+
+    pd.concat(summaries, ignore_index=True).to_csv(
+        os.path.join(SAVE_ROOT, "ablation_outer_5fold_summary.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.DataFrame(pooled_metric_rows).to_csv(
+        os.path.join(SAVE_ROOT, "ablation_pooled_outer_test_metrics.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.concat(pooled_bootstrap_frames, ignore_index=True).to_csv(
+        os.path.join(SAVE_ROOT, "ablation_pooled_outer_test_bootstrap_ci.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.DataFrame(pooled_calibration_rows).to_csv(
+        os.path.join(SAVE_ROOT, "ablation_pooled_outer_test_calibration.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    pd.concat(prediction_frames, ignore_index=True)[PREDICTION_COLUMNS].to_csv(
+        os.path.join(SAVE_ROOT, "standardized_predictions.csv"),
+        index=False,
+        encoding="utf-8-sig",
+    )
+    save_epoch_metrics(all_epoch_metric_rows, SAVE_ROOT)
+
+    print("\n================ Feature Ablation Summary ================")
+    print(pd.DataFrame(pooled_metric_rows).to_string(index=False))
 
 
 if __name__ == "__main__":
